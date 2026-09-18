@@ -2,7 +2,6 @@ import random
 import numpy as np
 from game import run_one_game
 from agent_baselines import StaticAgent, RandomAgent, GreedyAgent, AttitudeAgent
-from agent_groupnumber import StudentAgent
 
 # This file provides an example to simulate one game and export the game process for visualization.
 
