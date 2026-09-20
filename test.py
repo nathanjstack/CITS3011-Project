@@ -4,7 +4,7 @@ from tqdm import tqdm
 from game import run_one_game
 from collections import defaultdict
 from agent_baselines import StaticAgent, RandomAgent, GreedyAgent, AttitudeAgent
-from agent_groupnumber import StudentAgent
+from agent_2 import StudentAgent
 
 # This file provides examples for you to test the performance of your agents. The testing code may be different during the marking.
 

@@ -1,5 +1,5 @@
 # json file for previewing game
-*.json
+.json
 
 # ==========================================
 # Dependencies & Package Managers
