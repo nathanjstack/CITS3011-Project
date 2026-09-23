@@ -1,5 +1,6 @@
 import time
 import heapq
+import random
 import networkx as nx
 from collections import defaultdict
 from agent_baselines import Agent
@@ -36,6 +37,7 @@ class StudentAgent(Agent):
         self.ENEMY_PENALTY_PASS = 15.0 # cost to move past enemy province
         self.ENEMY_PENALTY_ATTACK = 5.0 # cost to attack an enemy province
         self.FRIENDLY_BLOCK_COST = float('inf') # cannot make routes through own units
+        self.MAX_TARGETS_PER_UNIT = 5
 
     def new_game(self, game, power_name):
         self.game = game
@@ -50,6 +52,116 @@ class StudentAgent(Agent):
 
     # step 1: building the map
 
+    def get_center_owners(self):
+        """
+        Returns {supply_center_name: power_name}
+        """
+        owners = {}
+        try:
+            for p in self.game.powers.keys():
+                for c in self.game.get_centers(p):
+                    owners[c.upper()] = p
+        except Exception:
+            pass
+        return owners
+
+    def choose_targets(self, loc, kind, friendly_occ, enemy_occ, reserved_dests, center_owners):
+        """
+        Pick better targets:
+        - prefer neutral SCs
+        - prefer non-owned SCs
+        - avoid own SCs unless there is nothing else
+        - avoid friendly-occupied SCs
+        """
+        max_targets = getattr(self, "MAX_TARGETS_PER_UNIT", 5)
+        dist_table = self.dist_army if kind == "Army" else self.dist_fleet
+
+        if loc not in dist_table:
+            return []
+
+        scored = []
+        for sc in self.supply_centers:
+            if sc in reserved_dests:
+                continue
+            if sc in friendly_occ:
+                continue
+
+            d = dist_table[loc].get(sc, float('inf'))
+            if d == float('inf'):
+                continue
+
+            owner = center_owners.get(sc)
+            score = d
+
+            # Strongly avoid targeting our own centers unless forced
+            if owner == self.power_name:
+                score += 1000.0
+
+            # Enemy-occupied centers are riskier
+            if sc in enemy_occ:
+                score += 8.0
+
+            # Slightly prefer neutral centers
+            if owner is None:
+                score -= 2.0
+
+            scored.append((score, sc))
+
+        scored.sort(key=lambda x: x[0])
+
+        # Prefer non-owned targets if any exist
+        non_own = [sc for _, sc in scored if center_owners.get(sc) != self.power_name]
+        if non_own:
+            return non_own[:max_targets]
+
+        # If only own centers remain, allow them
+        return [sc for _, sc in scored[:max_targets]]
+
+    def add_simple_supports(self, final_orders, unit_options):
+        """
+        Very simple support logic:
+        If one unit is moving to a target and another unit can legally support that move,
+        sometimes convert the second unit's move/hold into support.
+        """
+        order_by_token = {}
+        for order in final_orders:
+            parts = order.split()
+            if len(parts) >= 2:
+                token = f"{parts[0]} {parts[1]}"
+                order_by_token[token] = order
+
+        move_tokens = []
+        for token, order in order_by_token.items():
+            parts = order.split()
+            if len(parts) >= 4 and parts[2] == '-':
+                move_tokens.append((token, order))
+
+        # Prioritize supporting moves into supply centers
+        move_tokens.sort(key=lambda x: 0 if x[1].split()[3].upper() in self.supply_centers else 1)
+
+        used_supporters = set()
+
+        for target_token, target_order in move_tokens:
+            for support_token, support_order in list(order_by_token.items()):
+                if support_token == target_token:
+                    continue
+                if support_token in used_supporters:
+                    continue
+                if ' S ' in support_order:
+                    continue
+
+                # Find a legal support option for this exact move
+                for opt in unit_options.get(support_token, []):
+                    if ' S ' in opt and opt.endswith(target_order):
+                        order_by_token[support_token] = opt
+                        used_supporters.add(support_token)
+                        break
+
+                if support_token in used_supporters:
+                    break
+
+        return list(order_by_token.values())
+    
     def build_static_map(self, game):
         """
         builds adjacency graphs for armies, calculates
@@ -57,9 +169,9 @@ class StudentAgent(Agent):
         """
         locations_dict = {}
         
-        # Try standard API: game.map.loc_type
+        # Uppercase all keys and values to ensure consistency across engine APIs
         if hasattr(game.map, 'loc_type'):
-            locations_dict = game.map.loc_type.copy()
+            locations_dict = {k.upper(): str(v).upper() for k, v in game.map.loc_type.items()}
         else:
             raise AttributeError("Cannot find map locations in game.map")
 
@@ -68,7 +180,7 @@ class StudentAgent(Agent):
         if hasattr(game.map, 'scs'):
             raw_scs = game.map.scs
             for sc in raw_scs:
-                name = getattr(sc, 'name', str(sc))
+                name = getattr(sc, 'name', str(sc)).upper()
                 if name in locations_dict:
                     sc_names.append(name)
             
@@ -79,7 +191,7 @@ class StudentAgent(Agent):
         g_fleet = nx.Graph()
         
         def get_loc_type(loc_name):
-            return str(locations_dict.get(loc_name, "")).upper()
+            return locations_dict.get(loc_name.upper(), "")
 
         for loc_name in locations_dict.keys():
             l_type = get_loc_type(loc_name)
@@ -87,44 +199,43 @@ class StudentAgent(Agent):
             is_coast = 'COAST' in l_type
             is_land = 'LAND' in l_type
             
-            # check army type (land or coast)
             if is_land or is_coast:
                 g_army.add_node(loc_name)
-                
-                # Get neighbors
-                neighbors = set()
-                if hasattr(game.map, 'adjacent_provinces'):
-                    adj = game.map.adjacent_provinces.get(loc_name, [])
-                    for n in adj:
-                        neighbors.add(getattr(n, 'name', str(n)))
-                elif hasattr(game.map, 'get_neighbors'):
-                     neighbors = set(game.map.get_neighbors(loc_name))
-                
-                for nb_name in neighbors:
-                    if nb_name not in locations_dict: continue
-                    nb_type = get_loc_type(nb_name)
-                    # Armies cannot enter Sea/Water
-                    if 'SEA' not in nb_type and 'WATER' not in nb_type:
-                        g_army.add_edge(loc_name, nb_name)
-
-            # FLEETS: Sea or Coast
             if is_sea or is_coast:
                 g_fleet.add_node(loc_name)
-                
+
+        # Use the engine's native abuts() method for highly accurate adjacency mapping
+        if hasattr(game.map, 'abuts'):
+            locs = list(locations_dict.keys())
+            for i in locs:
+                for j in locs:
+                    if i == j: continue
+                    if i in g_army and j in g_army:
+                        if game.map.abuts('A', i, '-', j):
+                            g_army.add_edge(i, j)
+                    if i in g_fleet and j in g_fleet:
+                        if game.map.abuts('F', i, '-', j):
+                            g_fleet.add_edge(i, j)
+        else:
+            # Fallback if abuts is somehow not available
+            for loc_name in locations_dict.keys():
                 neighbors = set()
                 if hasattr(game.map, 'adjacent_provinces'):
                     adj = game.map.adjacent_provinces.get(loc_name, [])
                     for n in adj:
-                        neighbors.add(getattr(n, 'name', str(n)))
+                        neighbors.add(getattr(n, 'name', str(n)).upper())
                 elif hasattr(game.map, 'get_neighbors'):
-                     neighbors = set(game.map.get_neighbors(loc_name))
+                     neighbors = set(n.upper() for n in game.map.get_neighbors(loc_name))
                      
                 for nb_name in neighbors:
                     if nb_name not in locations_dict: continue
                     nb_type = get_loc_type(nb_name)
-                    # Fleets cannot enter Land
-                    if 'SEA' in nb_type or 'WATER' in nb_type or 'COAST' in nb_type:
-                        g_fleet.add_edge(loc_name, nb_name)
+                    if loc_name in g_army and nb_name in g_army:
+                        if 'SEA' not in nb_type and 'WATER' not in nb_type:
+                            g_army.add_edge(loc_name, nb_name)
+                    if loc_name in g_fleet and nb_name in g_fleet:
+                        if 'SEA' in nb_type or 'WATER' in nb_type or 'COAST' in nb_type:
+                            g_fleet.add_edge(loc_name, nb_name)
 
         self.graph_army = g_army
         self.graph_fleet = g_fleet
@@ -154,7 +265,7 @@ class StudentAgent(Agent):
         for pname, power in self.game.powers.items():
             for u in power.units:
                 # Units are formatted like "A LON"
-                loc = u.split()[1]
+                loc = u.split()[1].upper()
                 if pname == self.power_name:
                     friendly_occ.add(loc)
                 else:
@@ -179,7 +290,6 @@ class StudentAgent(Agent):
             dist_table = self.dist_fleet
             
         if start_loc not in adj_graph or goal_loc not in dist_table.get(start_loc, {}):
-            # cannot be reached
             return None 
 
         start_h = dist_table[start_loc].get(goal_loc, float('inf'))
@@ -216,284 +326,273 @@ class StudentAgent(Agent):
             for neighbor in adj_graph.neighbors(current):
                 if neighbor in closed_set:
                     continue
-                    
+
                 # calculate base movement cost
-                step_cost = 1.0 
-                
+                step_cost = 1.0
+
                 # Cannot plan through own units
                 if neighbor in friendly_occ and neighbor != goal_loc:
-                    continue 
-                    
-                # Enemy Penalty
+                    continue
+
+                # Do not route through enemy-occupied provinces.
+                # Only allow attacking the actual goal if it is enemy-occupied.
                 if neighbor in enemy_occ:
                     if neighbor == goal_loc:
-                        # attacking target is allowed but has penalty
                         step_cost += self.ENEMY_PENALTY_ATTACK
                     else:
-                        # passing through enemy territory is expensiveA
-                        step_cost += self.ENEMY_PENALTY_PASS
-                
+                        continue
+
                 tentative_g = g + step_cost
-                
+
                 if tentative_g < g_scores.get(neighbor, float('inf')):
                     g_scores[neighbor] = tentative_g
                     parents[neighbor] = current
-                    
+
                     # Static distance to goal
                     h = dist_table[neighbor].get(goal_loc, float('inf'))
                     if h == float('inf'):
                         continue
-                        
+
                     f_new = tentative_g + h
                     heapq.heappush(open_heap, (f_new, tentative_g, neighbor))
                     
-        # no path located
         return None
 
     # step 3. generating actions
 
-    def get_legal_orders(self):
+    def handle_non_movement(self):
         """
-        extract legal orders for this power.
+        Handles Retreat and Adjustment phases more safely.
         """
-        legal_strings = []
+        phase_type = getattr(self.game, 'phase_type', 'M')
+        all_possible_orders = self.game.get_all_possible_orders()
+        orderable_locations = self.game.get_orderable_locations(self.power_name)
+        power_orders = []
+
+        if phase_type == 'R':
+            friendly_occ, enemy_occ = self.get_dynamic_costs()
+            center_owners = self.get_center_owners()
+            my_centers = {c for c, p in center_owners.items() if p == self.power_name}
+        else:
+            friendly_occ, enemy_occ = set(), set()
+            my_centers = set()
+
+        for loc in orderable_locations:
+            possible = all_possible_orders.get(loc, [])
+            if not possible:
+                continue
+
+            strings = [o.as_string() if hasattr(o, 'as_string') else str(o) for o in possible]
+
+            if phase_type == 'R':
+                retreats = [s for s in strings if ' R ' in s]
+                if retreats:
+                    best_retreat = None
+                    best_score = float('inf')
+
+                    for s in retreats:
+                        parts = s.split()
+                        if len(parts) < 4:
+                            continue
+
+                        dest = parts[3].upper()
+                        unit_kind = "Fleet" if parts[0] == "F" else "Army"
+                        dist_table = self.dist_fleet if unit_kind == "Fleet" else self.dist_army
+
+                        score = 0.0
+
+                        if dest in enemy_occ:
+                            score += 1000.0
+                        if dest in friendly_occ:
+                            score += 500.0
+
+                        # Prefer retreating closer to our owned centers
+                        if dest in dist_table and my_centers:
+                            dists = [dist_table[dest].get(c, float('inf')) for c in my_centers]
+                            best_dist = min(dists)
+                            if best_dist != float('inf'):
+                                score += best_dist
+
+                        if score < best_score:
+                            best_score = score
+                            best_retreat = s
+
+                    power_orders.append(best_retreat if best_retreat else random.choice(retreats))
+                else:
+                    disbands = [s for s in strings if s.split() and s.split()[-1] == 'D']
+                    power_orders.append(disbands[0] if disbands else random.choice(strings))
+
+            elif phase_type == 'A':
+                builds = [s for s in strings if s.split() and s.split()[-1] == 'B']
+                if builds:
+                    armies = [s for s in builds if s.startswith('A ')]
+                    fleets = [s for s in builds if s.startswith('F ')]
+
+                    # Simple heuristic: prefer armies unless only fleets are available.
+                    # You can improve this later based on map position.
+                    power_orders.append(random.choice(armies) if armies else random.choice(fleets))
+                else:
+                    disbands = [s for s in strings if s.split() and s.split()[-1] == 'D']
+                    if disbands:
+                        power_orders.append(disbands[0])
+                    else:
+                        power_orders.append(random.choice(strings))
+            else:
+                power_orders.append(random.choice(strings))
+
+        return power_orders
+    
+    def get_actions(self):
+        """
+        Uses A* to plan routes and take actions on first steps.
+        Improved target selection and simple support logic.
+        """
+        deadline = time.perf_counter() + self.TIME_BUDGET
+
+        # Use phase_type directly to accurately detect non-movement phases
+        if getattr(self.game, 'phase_type', 'M') != 'M':
+            return self.handle_non_movement()
+
+        # Move Phase Logic
         try:
-            all_orders_dict = self.game.get_all_possible_orders()
+            all_possible_orders = self.game.get_all_possible_orders()
         except Exception:
             return []
 
-        my_units_str = self.game.powers[self.power_name].units
-        
-        for unit_str in my_units_str:
-            parts = unit_str.split()
-            if len(parts) < 2: 
-                continue
-            loc_code = parts[1]
-            
-            if loc_code in all_orders_dict:
-                raw_orders = all_orders_dict[loc_code]
-                for o in raw_orders:
-                    s = o.as_string() if hasattr(o, 'as_string') else str(o)
-                    legal_strings.append(s)
-        return legal_strings
-
-    def get_actions(self):
-        """
-        uses A* to plan routes and take actions on first steps
-        """
-        deadline = time.perf_counter() + self.TIME_BUDGET
-        phase = self.game.get_current_phase()
-        
-        # check which phase the game is in
-        if "Retreat" in phase:
-            return self.handle_retreats(deadline)
-        if "Adjustment" in phase:
-            return self.handle_adjustments(deadline)
-
-        # Move Phase Logic
-        legal_order_strings = self.get_legal_orders()
-        if not legal_order_strings:
-            return []
+        orderable_locations = self.game.get_orderable_locations(self.power_name)
 
         # orders grouped by unit token
         unit_options = defaultdict(list)
-        for order_str in legal_order_strings:
-            parts = order_str.split()
-            if len(parts) >= 2:
-                token = f"{parts[0]} {parts[1]}"
-                unit_options[token].append(order_str)
+        for loc in orderable_locations:
+            possible = all_possible_orders.get(loc, [])
+            for o in possible:
+                order_str = o.as_string() if hasattr(o, 'as_string') else str(o)
+                parts = order_str.split()
+                if len(parts) >= 2:
+                    token = f"{parts[0]} {parts[1]}"
+                    unit_options[token].append(order_str)
+
+        if not unit_options:
+            return []
 
         friendly_occ, enemy_occ = self.get_dynamic_costs()
+        center_owners = self.get_center_owners()
+
         final_orders = []
         reserved_dests = set()
 
         # sort units by those with the fewest options first
-        # so that other units with more options dont take their moves
         sorted_tokens = sorted(unit_options.keys(), key=lambda t: len(unit_options[t]))
 
         for token in sorted_tokens:
-            if time.perf_counter() > deadline:
-                break
-                
             options = unit_options[token]
+            hold_opt = next((opt for opt in options if opt.endswith(' H')), None)
+
+            if time.perf_counter() > deadline:
+                final_orders.append(hold_opt if hold_opt else options[0])
+                continue
+
             prefix, loc = token.split()
+            loc = loc.upper()
             kind = "Fleet" if prefix == "F" else "Army"
-            
-            # Identify Candidate Targets (Unowned SCs)
-            
+
             dist_table = self.dist_army if kind == "Army" else self.dist_fleet
             if loc not in dist_table:
-                 final_orders.append(f"{token} H")
-                 continue
+                final_orders.append(hold_opt if hold_opt else options[0])
+                continue
 
-            # get all reachable supply centres sorted by static distance
-            candidate_scs = [sc for sc, d in dist_table[loc].items() if d != float('inf')]
-            candidate_scs.sort(key=lambda sc: dist_table[loc][sc])
-            
-            # take top 3 targets to limit A* searches
-            top_targets = candidate_scs[:3]
-            
+            # Choose meaningful targets: neutrals / enemy SCs, not our own centers if possible
+            top_targets = self.choose_targets(
+                loc,
+                kind,
+                friendly_occ,
+                enemy_occ,
+                reserved_dests,
+                center_owners
+            )
+
             chosen_next_step = None
-            
+            chosen_target = None
+
             # run A* to each target
             for target_sc in top_targets:
                 if time.perf_counter() > deadline:
                     break
-                    
-                # dont target a supply centre already reserved by another unit this turn
-                if target_sc in reserved_dests:
-                    continue
 
                 path = self.astar_search(loc, target_sc, kind, friendly_occ, enemy_occ, deadline)
-                
+
                 if path and len(path) > 1:
                     next_step = path[1]
-                    
+
                     # Check if this move is actually legal according to engine
                     matching_option = None
                     for opt in options:
                         parts_opt = opt.split()
                         if len(parts_opt) >= 4 and parts_opt[2] == '-':
-                            if parts_opt[3] == next_step:
+                            if parts_opt[3].upper() == next_step:
                                 matching_option = opt
                                 break
-                    
+
                     if matching_option:
                         chosen_next_step = matching_option
-                        # valid path found
+                        chosen_target = target_sc
                         break
 
-            # 3. Execute Best Move or Fallback
+            # Execute Best Move or Fallback
             if chosen_next_step:
                 final_orders.append(chosen_next_step)
-                # Reserve destination
-                dest = chosen_next_step.split()[3]
+
+                dest = chosen_next_step.split()[3].upper()
                 reserved_dests.add(dest)
-                
+
+                # Also reserve the strategic target so multiple units do not aim for the same SC
+                if chosen_target:
+                    reserved_dests.add(chosen_target)
+
                 # Update local planning occupancy to reduce self-collision
                 friendly_occ.discard(loc)
                 friendly_occ.add(dest)
+
             else:
-                # fallback is to use greedy distance
+                # fallback: greedy one-step move
                 best_order = None
                 best_score = -float('inf')
-                
+
                 for opt in options:
                     parts = opt.split()
                     if len(parts) >= 4 and parts[2] == '-':
-                        dest = parts[3]
+                        dest = parts[3].upper()
+
                         if dest in reserved_dests:
                             continue
-                        
-                        # score establishes that closer to supply center is better
+                        if dest in friendly_occ:
+                            continue
+
                         curr_min = min(dist_table[loc].values()) if dist_table[loc] else float('inf')
                         dest_min = min(dist_table[dest].values()) if dest in dist_table and dist_table[dest] else float('inf')
-                        
+
                         score = curr_min - dest_min
+
                         if dest in self.supply_centers:
                             score += 50
-                            
+
+                        if dest in enemy_occ:
+                            score -= 5
+
                         if score > best_score:
                             best_score = score
                             best_order = opt
-                
+
                 if best_order:
                     final_orders.append(best_order)
-                    dest = best_order.split()[3]
+                    dest = best_order.split()[3].upper()
                     reserved_dests.add(dest)
                     friendly_occ.discard(loc)
                     friendly_occ.add(dest)
                 else:
-                    final_orders.append(f"{token} H")
+                    final_orders.append(hold_opt if hold_opt else options[0])
+
+        # Add simple support orders where possible
+        final_orders = self.add_simple_supports(final_orders, unit_options)
 
         return final_orders
-
-    def handle_retreats(self, deadline):
-        """retreat logic is to move to safest nearby province."""
-        _, legal_retreats, disbands = self.parse_orders()
-        tokens = set(legal_retreats.keys()) | disbands
-        if not tokens:
-            return []
-            
-        orders = []
-        reserved = set()
-        friendly_occ, enemy_occ = self.get_dynamic_costs()
-        
-        for token in sorted(tokens):
-            prefix, loc = token.split()
-            kind = "Fleet" if prefix == "F" else "Army"
-            legal = set(legal_retreats.get(token, ())) - reserved
-            
-            best_dest = None
-            best_score = float('inf')
-            
-            dist_table = self.dist_army if kind == "Army" else self.dist_fleet
-            
-            for dest in legal:
-                # Prefer retreating towards own SCs or away from enemies
-                score = 0
-                if dest in enemy_occ:
-                    score += 100 # high penalty
-                if dest in friendly_occ:
-                    score += 50 # medium penalty due to risk of collision
-                    
-                # distance to nearest SC
-                if dest in dist_table and dist_table[dest]:
-                    min_d = min(dist_table[dest].values())
-                    score += min_d * 2
-                
-                if score < best_score:
-                    best_score = score
-                    best_dest = dest
-            
-            if best_dest:
-                orders.append(f"{token} R {best_dest}")
-                reserved.add(best_dest)
-            elif token in disbands:
-                orders.append(f"{token} D")
-            else:
-                # Force disband if no safe retreat
-                orders.append(f"{token} D") 
-                
-        return orders
-
-    def handle_adjustments(self, deadline):
-        # currently a placeholder, returning empty list, for winter adjustment phase
-        return []
-
-    def parse_orders(self):
-        """for parsing legal order into dictionaries"""
-        moves = defaultdict(set)
-        retreats = defaultdict(set)
-        disbands = set()
-        
-        try:
-            all_orders_dict = self.game.get_all_possible_orders()
-        except Exception:
-            return moves, retreats, disbands
-
-        my_units_str = self.game.powers[self.power_name].units
-        
-        for unit_str in my_units_str:
-            parts = unit_str.split()
-            if len(parts) < 2: continue
-            loc_code = parts[1]
-            
-            if loc_code in all_orders_dict:
-                raw_orders = all_orders_dict[loc_code]
-                for o in raw_orders:
-                    s = o.as_string() if hasattr(o, 'as_string') else str(o)
-                    sparts = s.split()
-                    if len(sparts) < 3: continue
-                    
-                    token = f"{sparts[0]} {sparts[1]}"
-                    action = sparts[2]
-                    
-                    if action == '-':
-                        moves[token].add(sparts[3])
-                    elif action == 'R':
-                        retreats[token].add(sparts[3])
-                    elif action == 'D':
-                        disbands.add(token)
-                        
-        return dict(moves), dict(retreats), disbands
