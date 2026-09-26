@@ -14,12 +14,6 @@ class StudentAgent(Agent):
     - Prefer neutral supply centers.
     - Prefer enemy supply centers.
     - Avoid targeting our own supply centers unless necessary.
-
-    This version intentionally does NOT include:
-    - coastal normalization,
-    - conditional support logic,
-    - advanced retreat logic,
-    - advanced adjustment/build logic.
     """
 
     def __init__(self, agent_name="AStarAgent"):
