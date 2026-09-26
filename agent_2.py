@@ -67,11 +67,8 @@ class StudentAgent(Agent):
 
     def choose_targets(self, loc, kind, friendly_occ, enemy_occ, reserved_dests, center_owners):
         """
-        Pick better targets:
-        - prefer neutral SCs
-        - prefer non-owned SCs
-        - avoid own SCs unless there is nothing else
-        - avoid friendly-occupied SCs
+        Basic targeting: purely nearest-SC by static graph distance.
+        No preference for neutral/enemy/owned status.
         """
         max_targets = getattr(self, "MAX_TARGETS_PER_UNIT", 5)
         dist_table = self.dist_army if kind == "Army" else self.dist_fleet
@@ -90,31 +87,9 @@ class StudentAgent(Agent):
             if d == float('inf'):
                 continue
 
-            owner = center_owners.get(sc)
-            score = d
-
-            # Strongly avoid targeting our own centers unless forced
-            if owner == self.power_name:
-                score += 1000.0
-
-            # Enemy-occupied centers are riskier
-            if sc in enemy_occ:
-                score += 8.0
-
-            # Slightly prefer neutral centers
-            if owner is None:
-                score -= 2.0
-
-            scored.append((score, sc))
+            scored.append((d, sc))
 
         scored.sort(key=lambda x: x[0])
-
-        # Prefer non-owned targets if any exist
-        non_own = [sc for _, sc in scored if center_owners.get(sc) != self.power_name]
-        if non_own:
-            return non_own[:max_targets]
-
-        # If only own centers remain, allow them
         return [sc for _, sc in scored[:max_targets]]
 
     def add_simple_supports(self, final_orders, unit_options):
