@@ -54,6 +54,52 @@ class StudentAgent(Agent):
     # Static map building
     ###########################################################################
 
+        # PASTE THIS FROM YOUR BASIC AGENT CODE
+    def add_simple_supports(self, final_orders, unit_options):
+        """
+        Very simple support logic:
+        If one unit is moving to a target and another unit can legally support that move,
+        sometimes convert the second unit's move/hold into support.
+        """
+        order_by_token = {}
+        for order in final_orders:
+            parts = order.split()
+            if len(parts) >= 2:
+                token = f"{parts[0]} {parts[1]}"
+                order_by_token[token] = order
+
+        move_tokens = []
+        for token, order in order_by_token.items():
+            parts = order.split()
+            if len(parts) >= 4 and parts[2] == '-':
+                move_tokens.append((token, order))
+
+        # Prioritize supporting moves into supply centers
+        move_tokens.sort(key=lambda x: 0 if x[1].split()[3].upper() in self.supply_centers else 1)
+
+        used_supporters = set()
+
+        for target_token, target_order in move_tokens:
+            for support_token, support_order in list(order_by_token.items()):
+                if support_token == target_token:
+                    continue
+                if support_token in used_supporters:
+                    continue
+                if ' S ' in support_order:
+                    continue
+
+                # Find a legal support option for this exact move
+                for opt in unit_options.get(support_token, []):
+                    if ' S ' in opt and opt.endswith(target_order):
+                        order_by_token[support_token] = opt
+                        used_supporters.add(support_token)
+                        break
+
+                if support_token in used_supporters:
+                    break
+
+        return list(order_by_token.values())
+    
     def build_static_map(self, game):
         """
         Builds army/fleet graphs and precomputes distances to supply centers.
@@ -588,5 +634,7 @@ class StudentAgent(Agent):
 
                 else:
                     final_orders.append(hold_opt if hold_opt else options[0])
+
+        final_orders = self.add_simple_supports(final_orders, unit_options)
 
         return final_orders
