@@ -54,7 +54,6 @@ class StudentAgent(Agent):
     # Static map building
     ###########################################################################
 
-        # PASTE THIS FROM YOUR BASIC AGENT CODE
     def add_simple_supports(self, final_orders, unit_options):
         """
         Very simple support logic:
