@@ -376,27 +376,85 @@ class StudentAgent(Agent):
 
     def handle_non_movement(self):
         """
-        Simple legal fallback for retreat/adjustment phases.
-
-        This is intentionally basic and is NOT one of the new techniques.
-        It just chooses random legal orders to avoid engine errors.
+        Handles Retreat and Adjustment phases more safely.
         """
-        try:
-            possible_orders = self.game.get_all_possible_orders()
-            orderable_locations = self.game.get_orderable_locations(self.power_name)
-        except Exception:
-            return []
+        phase_type = getattr(self.game, 'phase_type', 'M')
+        all_possible_orders = self.game.get_all_possible_orders()
+        orderable_locations = self.game.get_orderable_locations(self.power_name)
+        power_orders = []
 
-        orders = []
+        if phase_type == 'R':
+            friendly_occ, enemy_occ = self.get_dynamic_costs()
+            center_owners = self.get_center_owners()
+            my_centers = {c for c, p in center_owners.items() if p == self.power_name}
+        else:
+            friendly_occ, enemy_occ = set(), set()
+            my_centers = set()
 
         for loc in orderable_locations:
-            possible = possible_orders.get(loc, [])
-            if possible:
-                order = random.choice(possible)
-                order_str = order.as_string() if hasattr(order, "as_string") else str(order)
-                orders.append(order_str)
+            possible = all_possible_orders.get(loc, [])
+            if not possible:
+                continue
 
-        return orders
+            strings = [o.as_string() if hasattr(o, 'as_string') else str(o) for o in possible]
+
+            if phase_type == 'R':
+                retreats = [s for s in strings if ' R ' in s]
+                if retreats:
+                    best_retreat = None
+                    best_score = float('inf')
+
+                    for s in retreats:
+                        parts = s.split()
+                        if len(parts) < 4:
+                            continue
+
+                        dest = parts[3].upper()
+                        unit_kind = "Fleet" if parts[0] == "F" else "Army"
+                        dist_table = self.dist_fleet if unit_kind == "Fleet" else self.dist_army
+
+                        score = 0.0
+
+                        if dest in enemy_occ:
+                            score += 1000.0
+                        if dest in friendly_occ:
+                            score += 500.0
+
+                        # Prefer retreating closer to our owned centers
+                        if dest in dist_table and my_centers:
+                            dists = [dist_table[dest].get(c, float('inf')) for c in my_centers]
+                            best_dist = min(dists)
+                            if best_dist != float('inf'):
+                                score += best_dist
+
+                        if score < best_score:
+                            best_score = score
+                            best_retreat = s
+
+                    power_orders.append(best_retreat if best_retreat else random.choice(retreats))
+                else:
+                    disbands = [s for s in strings if s.split() and s.split()[-1] == 'D']
+                    power_orders.append(disbands[0] if disbands else random.choice(strings))
+
+            elif phase_type == 'A':
+                builds = [s for s in strings if s.split() and s.split()[-1] == 'B']
+                if builds:
+                    armies = [s for s in builds if s.startswith('A ')]
+                    fleets = [s for s in builds if s.startswith('F ')]
+
+                    # Simple heuristic: prefer armies unless only fleets are available.
+                    # You can improve this later based on map position.
+                    power_orders.append(random.choice(armies) if armies else random.choice(fleets))
+                else:
+                    disbands = [s for s in strings if s.split() and s.split()[-1] == 'D']
+                    if disbands:
+                        power_orders.append(disbands[0])
+                    else:
+                        power_orders.append(random.choice(strings))
+            else:
+                power_orders.append(random.choice(strings))
+
+        return power_orders
 
     ###########################################################################
     # Main action generation
