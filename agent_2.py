@@ -9,18 +9,12 @@ INF = float("inf")
 
 class StudentAgent(Agent):
     """
-    Search-based Diplomacy agent.
+    Technique 2 (joint-order planning)
 
     Pipeline per movement phase:
-      goal assignment -> enemy scenario model (hold / greedy / coordinated
-      attack) -> internal adjudicator -> local search over joint orders
-      (attack+support and convoy macros) -> ENEMY BEST RESPONSE to our plan
-      (only for opponents that look competent) -> re-search against the mix.
-
-    The best-response step is what makes the agent robust against strong
-    opponents (Hidden Agent in scenario 3, other groups' agents in scenario 4).
-    Against passive/weak opponents it is skipped, so scenario 1/2 behaviour is
-    unchanged.
+      goal assignment -> internal adjudicator -> local search over joint orders
+      (attack+support and convoy macros), evaluated against a single enemy
+      model in which every enemy unit holds.
     """
 
     def __init__(self, agent_name="SearchAgent"):
@@ -34,10 +28,6 @@ class StudentAgent(Agent):
         self.all_dist_army = {}
         self.all_dist_fleet = {}
         self.supply_centers = []
-        self.static_order_streak = {}
-        self.static_scenario = False
-        self.last_enemy_targets = set()
-        self.hostile_powers = set()
         self.home_centers = set()
 
         self.SEARCH_BUDGET = 0.50       # seconds per movement phase (upper bound)
@@ -51,67 +41,18 @@ class StudentAgent(Agent):
         self.PROGRESS = 1.2
         self.DISLODGE_BONUS = 2.5
         self.BUILD_ROOM_BONUS = 2.0
-        self.SCENARIO_WEIGHTS = (0.3, 0.4, 0.3)   # hold, greedy, attack
-
-        # --- new knobs -------------------------------------------------------
-        self.BR_WEIGHT = 0.30           # weight of the enemy best-response scenario (0 disables)
-        self.BR_TIME_SHARE = 0.15       # share of the budget spent computing the best response
-        self.PHASE1_SHARE = 0.50        # share of the budget for the first search
         self.LEADER_SC = 12             # owners with >= this many SCs get extra attention
 
     # ------------------------------------------------------------------ setup
     def new_game(self, game, power_name):
         self.game = game
         self.power_name = power_name
-        self.static_order_streak = {p: 0 for p in game.powers if p != power_name}
-        self.static_scenario = False
-        self.last_enemy_targets = set()
-        self.hostile_powers = set()
         self._dcache = {}
         self.home_centers = {str(c).upper() for c in game.get_centers(power_name)}
-        self._stay = defaultdict(lambda: [0, 0])   # power -> [held on own SC, total]
-        self._sup = defaultdict(int)               # power -> number of support orders seen
-        self._last_obs = None
-        self._last_plan = {}
-        self._fail = defaultdict(int)              # (token, dest) -> failed attempts
         self.build_static_map(game)
 
     def update_game(self, all_power_orders):
         # Do not change this code.
-        if getattr(self.game, 'phase_type', 'M') == 'M':
-            own_centers = {str(c).upper() for c in self.game.get_centers(self.power_name)}
-            own_units = set()
-            for unit in self.game.get_units(self.power_name):
-                parts = str(unit).split()
-                if len(parts) >= 2:
-                    own_units.add(parts[1].upper().split('/')[0])
-            own_locations = own_centers | own_units
-            self.last_enemy_targets = set()
-            for p in self.static_order_streak:
-                orders = all_power_orders.get(p, [])
-                if not orders:
-                    self.static_order_streak[p] += 1
-                else:
-                    self.static_order_streak[p] = 0
-                for order in orders:
-                    parts = str(order).split()
-                    if len(parts) >= 4 and parts[2] == '-':
-                        target = parts[3].upper().split('/')[0]
-                        if target in own_centers:
-                            self.last_enemy_targets.add(target)
-                        if target in own_locations:
-                            self.hostile_powers.add(p)
-                    # A supported move is evidence of intent too, even if the
-                    # attacking unit itself is not adjacent to our territory.
-                    if ' S ' in str(order):
-                        supported_move = str(order).split(' S ', 1)[1].split()
-                        if len(supported_move) >= 4 and supported_move[2] == '-':
-                            target = supported_move[3].upper().split('/')[0]
-                            if target in own_locations:
-                                self.hostile_powers.add(p)
-            self.static_scenario = bool(self.static_order_streak) and all(
-                streak > 0 for streak in self.static_order_streak.values()
-            )
         for p in all_power_orders.keys():
             self.game.set_orders(p, all_power_orders[p])
         self.game.process()
@@ -286,60 +227,6 @@ class StudentAgent(Agent):
                      if n in table), default=INF)
         self._dcache[key] = v
         return v
-
-    def _stay_rate(self, p):
-        held, total = self._stay[p]
-        return (held + 2.0) / (total + 3.0)
-
-    def _observe(self, unit_tokens):
-        """Learn from the previous movement phase (enemy hold rate, supports used,
-        our failed moves)."""
-        try:
-            hist = getattr(self.game, 'order_history', None)
-            if hist:
-                phases = [ph for ph in hist.keys() if str(ph).endswith('M')]
-                if phases and phases[-1] != self._last_obs:
-                    self._last_obs = phases[-1]
-                    owners = self.get_center_owners()
-                    for p, orders in hist[phases[-1]].items():
-                        if p == self.power_name:
-                            continue
-                        for o in orders:
-                            parts = str(o).split()
-                            if len(parts) < 3:
-                                continue
-                            if parts[2] == 'S':
-                                self._sup[p] += 1
-                            prov = parts[1].upper().split('/')[0]
-                            if prov in self.supply_centers and owners.get(prov) == p:
-                                rec = self._stay[p]
-                                rec[1] += 1
-                                if parts[2] != '-':
-                                    rec[0] += 1
-                    # our own bounced moves
-                    for tok, order in self._last_plan.items():
-                        parts = order.split()
-                        if len(parts) >= 4 and parts[2] == '-' and 'VIA' not in parts:
-                            key = (tok, parts[3].upper().split('/')[0])
-                            if tok in unit_tokens:
-                                self._fail[key] += 1
-                            else:
-                                self._fail.pop(key, None)
-            for key in list(self._fail):
-                if key[0] not in unit_tokens:
-                    del self._fail[key]
-        except Exception:
-            pass
-
-    def _smart_powers(self):
-        """Opponents that look competent: they use supports, or have attacked us."""
-        smart = set()
-        for p in self.static_order_streak:
-            if self.static_order_streak.get(p, 0) > 0:
-                continue                      # sends no orders at all -> passive
-            if self._sup.get(p, 0) >= 1 or p in self.hostile_powers:
-                smart.add(p)
-        return smart
 
     ###########################################################################
     # Internal adjudicator
@@ -530,74 +417,6 @@ class StudentAgent(Agent):
         return goals
 
     ###########################################################################
-    # Enemy behaviour model
-    ###########################################################################
-    def _enemy_scenarios(self, enemies, m, owners, my_prov_set):
-        """
-        enemies: list of (power, kind, loc, prov). Returns three order lists
-        (hold, greedy advance, coordinated attack) indexed like enemies.
-        """
-        me = self.power_name
-        n = len(enemies)
-        hold = [('H',)] * n
-        greedy = [('H',)] * n
-        attack = [('H',)] * n
-        power_targets = {}
-        by_power_prov = defaultdict(set)
-        for (p, k, loc, prov) in enemies:
-            by_power_prov[p].add(prov)
-        passive = {p for p, st in self.static_order_streak.items() if st > 0}
-        for idx, (p, k, loc, prov) in enumerate(enemies):
-            graph = self.graph_fleet if k == 'F' else self.graph_army
-            if loc not in graph or p in passive:
-                continue
-            nbrs = sorted({x.split('/')[0] for x in graph.neighbors(loc)})
-            # greedy advance
-            if p not in power_targets:
-                power_targets[p] = [sc for sc in self.supply_centers if owners.get(sc) != p]
-            tg = power_targets[p]
-            if prov in tg or (owners.get(prov) == p and self._stay_rate(p) >= 0.5):
-                pass  # standing on a centre it wants / defends: hold
-            else:
-                best, bd = None, INF
-                cur_d = min((self._dist(k, loc, sc) for sc in tg), default=INF)
-                for q in nbrs:
-                    if q in by_power_prov[p]:
-                        continue
-                    d = min((self._dist(k, q, sc) for sc in tg), default=INF)
-                    if d < bd:
-                        best, bd = q, d
-                if best is not None and bd < cur_d:
-                    greedy[idx] = ('M', best, False)
-            # coordinated attack on us / neutral centres
-            best, bs = None, 0.0
-            for q in nbrs:
-                if q in by_power_prov[p]:
-                    continue
-                s = 0.0
-                if owners.get(q) == me:
-                    s += 8.0
-                if q in my_prov_set:
-                    s += 4.0
-                if q in self.supply_centers and owners.get(q) is None:
-                    s += 3.0
-                if s > bs:
-                    best, bs = q, s
-            if best is not None:
-                attack[idx] = ('M', best, False)
-        # convert duplicate attackers of the same power into supporters
-        seen = {}
-        for idx, o in enumerate(attack):
-            if o[0] != 'M':
-                continue
-            key = (enemies[idx][0], o[1])
-            if key in seen:
-                attack[idx] = ('SM', m + seen[key], o[1])
-            else:
-                seen[key] = idx
-        return hold, greedy, attack
-
-    ###########################################################################
     # Movement planner
     ###########################################################################
     def plan_movement(self, unit_options, deadline):
@@ -722,9 +541,10 @@ class StudentAgent(Agent):
                 continue
             if loc in graph and any(x.split('/')[0] in zone for x in graph.neighbors(loc)):
                 rel.append(e)
-        e_hold, e_greedy, e_attack = self._enemy_scenarios(rel, m, owners, my_prov_set)
-        scen_orders = [e_hold, e_greedy, e_attack]
-        weights = list(self.SCENARIO_WEIGHTS)      # mutated in place later
+        # Single enemy model: every relevant enemy unit holds.
+        e_hold = [('H',)] * len(rel)
+        scen_orders = [e_hold]
+        weights = [1.0]
         prov_all = [infos[i][2] for i in range(m)] + [e[3] for e in rel]
         pw_all = [0] * m + [pids[e[0]] for e in rel]
 
@@ -739,8 +559,6 @@ class StudentAgent(Agent):
                 v += 1.0
             else:
                 v += 1.5 + min(4.0, max(0, counts[o] - 5) * 0.5)
-                if o in self.hostile_powers:
-                    v += 1.0
                 if counts[o] >= self.LEADER_SC:
                     # containing a runaway leader matters more than a normal grab
                     v += 1.5 + min(4.0, 0.75 * (counts[o] - self.LEADER_SC))
@@ -762,21 +580,8 @@ class StudentAgent(Agent):
         sea_provs = self.sea_provs
         padj = self.padj_fleet
 
-        fail_pen = {}
-        for i, t in enumerate(tokens):
-            for (tk, dest), cnt in self._fail.items():
-                if tk == t:
-                    fail_pen[(i, dest)] = 2.5 * min(cnt, 3)
-
         def raw_score(my_orders):
             total = 0.0
-            pen = 0.0
-            if fail_pen:
-                sup_t = {o[1] for o in my_orders if o[0] == 'SM'}
-                for i in range(m):
-                    o = my_orders[i]
-                    if o[0] == 'M' and i not in sup_t:
-                        pen += fail_pen.get((i, o[1]), 0.0)
             for w, eo in zip(weights, scen_orders):
                 orders = my_orders + eo
                 fpos, disl = self._adjudicate(prov_all, pw_all, orders)
@@ -827,7 +632,7 @@ class StudentAgent(Agent):
                     if room > 0:
                         v += self.BUILD_ROOM_BONUS * min(room, vacant_home)
                 total += w * v
-            return total - pen
+            return total
 
         memo = {}
 
@@ -908,167 +713,10 @@ class StudentAgent(Agent):
                     best, best_plan, best_str = v, list(cur), list(cur_str)
             return best, best_plan, best_str
 
-        # ---- opponent best-response machinery ---------------------------------
-        smart = self._smart_powers()
-        br_powers = sorted({e[0] for e in rel if e[0] in smart})
-        use_br = self.BR_WEIGHT > 0 and rel_n > 0 and bool(br_powers)
-
-        t_begin = time.perf_counter()
-        total_time = max(0.0, deadline - t_begin)
-        phase1_limit = deadline if not use_br else t_begin + total_time * self.PHASE1_SHARE
-
         start_plan = [b[0] for b in base]
         start_str = [b[1] for b in base]
-        best, best_plan, best_str = search(start_plan, start_str, phase1_limit, self.MAX_RESTARTS)
-
-        if use_br and time.perf_counter() < deadline - 0.03:
-            try:
-                br_limit = min(deadline, time.perf_counter() + total_time * self.BR_TIME_SHARE)
-                br_orders = self._enemy_best_response(
-                    best_plan, rel, br_powers, e_attack, m, owners, my_sc, my_prov_set,
-                    prov_all, pw_all, infos, spring, br_limit)
-                if br_orders is not None:
-                    w = self.BR_WEIGHT
-                    weights[:] = [x * (1.0 - w) for x in self.SCENARIO_WEIGHTS] + [w]
-                    scen_orders.append(br_orders)
-                    memo.clear()
-                    b2, p2, s2 = search(best_plan, best_str, deadline, self.MAX_RESTARTS)
-                    best_plan, best_str = p2, s2
-            except Exception:
-                pass
+        best, best_plan, best_str = search(start_plan, start_str, deadline, self.MAX_RESTARTS)
         return best_str
-
-    ###########################################################################
-    # Enemy best response (fictitious-play step)
-    ###########################################################################
-    def _enemy_best_response(self, my_plan, rel, powers, base_eo, m, owners, my_sc,
-                             my_prov_set, prov_all, pw_all, infos, spring, limit):
-        """
-        For every listed opponent power, improve its orders by coordinate descent
-        (single-unit changes + move/support pairs) against OUR current plan.
-        Returns an order list aligned with `rel` (enemy index k -> global m+k).
-        """
-        me = self.power_name
-        rel_n = len(rel)
-        sc_set = set(self.supply_centers)
-        ecap = 0.7 * (self.SPRING_CAPTURE if spring else self.FALL_CAPTURE)
-        interest = sc_set | my_prov_set | set(my_sc)
-
-        occ_by_power = defaultdict(set)
-        for (p, kd, loc, prov) in rel:
-            occ_by_power[p].add(prov)
-
-        nbrs = []
-        for (p, kd, loc, prov) in rel:
-            graph = self.graph_fleet if kd == 'F' else self.graph_army
-            if loc in graph:
-                nbrs.append(sorted({x.split('/')[0] for x in graph.neighbors(loc)}))
-            else:
-                nbrs.append([])
-
-        ecands = []
-        for k in range(rel_n):
-            p = rel[k][0]
-            out = [('H',)]
-            for q in nbrs[k]:
-                if q in occ_by_power[p]:
-                    continue
-                out.append(('M', q, False))
-            for k2 in range(rel_n):
-                if k2 == k or rel[k2][0] != p:
-                    continue
-                if rel[k2][3] in nbrs[k] and rel[k2][3] in interest:
-                    out.append(('SH', m + k2))
-                for q in nbrs[k2]:
-                    if q in nbrs[k] and q in interest and q not in occ_by_power[p]:
-                        out.append(('SM', m + k2, q))
-            ecands.append(out)
-
-        emacros = defaultdict(list)
-        for k2 in range(rel_n):
-            p = rel[k2][0]
-            for q in nbrs[k2]:
-                if q not in interest or q in occ_by_power[p]:
-                    continue
-                for k in range(rel_n):
-                    if k != k2 and rel[k][0] == p and q in nbrs[k]:
-                        emacros[p].append((k2, ('M', q, False), k, ('SM', m + k2, q)))
-
-        ptargets = {}
-        near_memo = {}
-        dist = self._dist
-
-        def enemy_near(p, kd, q):
-            key = (p, kd, q)
-            v = near_memo.get(key)
-            if v is None:
-                tg = ptargets.get(p)
-                if tg is None:
-                    tg = [sc for sc in self.supply_centers if owners.get(sc) != p]
-                    ptargets[p] = tg
-                v = min((dist(kd, q, sc) for sc in tg), default=INF)
-                near_memo[key] = v
-            return v
-
-        def enemy_value(idxs, p, eo):
-            fpos, disl = self._adjudicate(prov_all, pw_all, my_plan + eo)
-            v = 0.0
-            for k in idxs:
-                i = m + k
-                if disl[i]:
-                    v -= self.UNIT_LOSS
-                    continue
-                f = fpos[i]
-                if f in sc_set and owners.get(f) != p:
-                    c = ecap + (0.5 if owners.get(f) is None else 0.0)
-                    if owners.get(f) == me:
-                        c += 4.0
-                    v += c
-                d = enemy_near(p, rel[k][1], f)
-                v -= 0.5 * (d if d < INF else 8)
-            for i in range(m):
-                if disl[i]:
-                    v += 3.0 + (2.0 if infos[i][2] in my_sc else 0.0)
-            return v
-
-        eo = list(base_eo)
-        for p in powers:
-            idxs = [k for k in range(rel_n) if rel[k][0] == p]
-            if not idxs:
-                continue
-            best = enemy_value(idxs, p, eo)
-            for _ in range(2):
-                changed = False
-                for k in idxs:
-                    if time.perf_counter() > limit:
-                        return eo
-                    bo = None
-                    for c in ecands[k]:
-                        if c == eo[k]:
-                            continue
-                        old = eo[k]
-                        eo[k] = c
-                        v = enemy_value(idxs, p, eo)
-                        eo[k] = old
-                        if v > best + 1e-6:
-                            best, bo = v, c
-                    if bo is not None:
-                        eo[k] = bo
-                        changed = True
-                for (k2, mv, k, sup) in emacros[p]:
-                    if time.perf_counter() > limit:
-                        return eo
-                    o2, o1 = eo[k2], eo[k]
-                    eo[k2], eo[k] = mv, sup
-                    v = enemy_value(idxs, p, eo)
-                    if v > best + 1e-6:
-                        best = v
-                        changed = True
-                    else:
-                        eo[k2], eo[k] = o2, o1
-                if not changed:
-                    break
-        return eo
 
     ###########################################################################
     # Non-movement phases
@@ -1210,7 +858,6 @@ class StudentAgent(Agent):
         if not unit_options:
             return []
 
-        self._observe(set(unit_options.keys()))
         book = self._opening_book().get(self.power_name, {})
         if self.game.get_current_phase() == 'S1901M':
             orders = []
@@ -1222,13 +869,10 @@ class StudentAgent(Agent):
                     orders = None
                     break
             if orders:
-                self._last_plan = dict(zip(unit_options.keys(), orders))
                 return orders
         try:
             deadline = t0 + self.SEARCH_BUDGET
-            result = list(self.plan_movement(unit_options, deadline))
-            self._last_plan = dict(zip(unit_options.keys(), result))
-            return result
+            return list(self.plan_movement(unit_options, deadline))
         except Exception:
             import traceback
             traceback.print_exc()
