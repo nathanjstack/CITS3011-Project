@@ -211,12 +211,6 @@ class StudentAgent(Agent):
         self.dist_army = compute_dist_table(g_army, self.supply_centers)
         self.dist_fleet = compute_dist_table(g_fleet, self.supply_centers)
 
-        print(
-            f"A* Agent Initialized. "
-            f"SCs: {len(self.supply_centers)}, "
-            f"Army Nodes: {g_army.number_of_nodes()}"
-        )
-
     ###########################################################################
     # Dynamic helpers
     ###########################################################################
